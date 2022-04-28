@@ -31,18 +31,21 @@ parser.add_argument("--n_test", type=int, default=10000)
 parser.add_argument("--n_train", type=int, default=60000)
 parser.add_argument("--n_workers", type=int, default=-1)
 parser.add_argument("--exc", type=float, default=22.5)
-parser.add_argument("--inh", type=float, default=120)
+parser.add_argument("--inh", type=float, default=10)
 parser.add_argument("--theta_plus", type=float, default=0.05)
-parser.add_argument("--time", type=int, default=250)
+parser.add_argument("--time", type=int, default=500)
 parser.add_argument("--dt", type=int, default=1.0)
 parser.add_argument("--intensity", type=float, default=128)
 parser.add_argument("--progress_interval", type=int, default=10)
-parser.add_argument("--update_interval", type=int, default=250)
+parser.add_argument("--update_interval", type=int, default=300)
+parser.add_argument("--load", type=str, default=None)
 parser.add_argument("--train", dest="train", action="store_true")
 parser.add_argument("--test", dest="train", action="store_false")
 parser.add_argument("--plot", dest="plot", action="store_true")
 parser.add_argument("--gpu", dest="gpu", action="store_true")
-parser.set_defaults(plot=False, gpu=True)
+parser.add_argument("--teach", dest="teach", action="store_true")
+
+parser.set_defaults(plot=False, gpu=True, teach=False)
 
 args = parser.parse_args()
 
@@ -61,8 +64,10 @@ intensity = args.intensity
 progress_interval = args.progress_interval
 update_interval = args.update_interval
 train = args.train
+test = not train
 plot = args.plot
 gpu = args.gpu
+wmax = 1
 
 # Sets up Gpu use
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,7 +86,7 @@ print("Running on Device = ", device)
 if n_workers == -1:
     n_workers = 0  # gpu * 4 * torch.cuda.device_count()
 
-if not train:
+if not test:
     update_interval = n_test
 
 n_sqrt = int(np.ceil(np.sqrt(n_neurons)))
@@ -99,14 +104,23 @@ network = myNet(
     nu=(1e-4, 1e-2),
     theta_plus=theta_plus,
     inpt_shape=(1, 28, 28),
-    wmax=5,
+    wmax=wmax,
 )
-
+if args.load:
+    network= torch.load(open(args.load, "rb"))
 # Directs network to GPU
 if gpu:
     network.to("cuda")
 
 # Load MNIST data.
+class NormalizeIntensity():
+    def __init__(self, mean):
+        self.mean = mean
+
+    def __call__(self, tensor):
+        scale = self.mean / tensor.mean()
+        return tensor.mul_(scale)
+
 train_dataset = MNIST(
     PoissonEncoder(time=time, dt=dt),
     None,
@@ -114,7 +128,9 @@ train_dataset = MNIST(
     download=True,
     train=True,
     transform=transforms.Compose(
-        [transforms.ToTensor(), transforms.Lambda(lambda x: x * intensity)]
+        [transforms.ToTensor(),
+         NormalizeIntensity(0.12),
+         transforms.Lambda(lambda x: x * intensity)] # modify intensity to increase Hz
     ),
 )
 
@@ -166,6 +182,7 @@ network.add_monitor(output_spike, name="output")
 inpt_ims, inpt_axes = None, None
 spike_ims, spike_axes = None, None
 weights_im = None
+out_weights_im = None
 assigns_im = None
 perf_ax = None
 voltage_axes, voltage_ims = None, None
@@ -246,8 +263,10 @@ for epoch in range(n_epochs):
                 n_labels=n_classes,
                 rates=rates,
             )
-            labels = torch.stack(labels, dim=0)
-            pred_labels = torch.stack(pred_labels, dim=0).cpu()
+            labels = torch.stack(labels, dim=0).squeeze(1)
+            pred_labels = torch.stack(pred_labels, dim=0)
+            #print(labels)
+            #print(pred_labels)
             acc = (labels == pred_labels).sum()/len(labels)
             print("predict acc is", acc)
 
@@ -255,12 +274,12 @@ for epoch in range(n_epochs):
             pred_labels = []
 
         if step and not step % (2*update_interval):
-            network.save("%d.ckp" % step)
+            network.save("./ckp/%d.ckp" % step)
 
         labels.append(batch["label"])
 
         # Run the network on the input.
-        network.run(inputs=inputs, time=time, input_time_dim=1, label = batch["label"][0].to(device))
+        network.run(inputs=inputs, time=time, input_time_dim=1, label=batch["label"][0].to(device), teach=args.teach)
 
         # Get voltage recording.
         exc_voltages = exc_voltage_monitor.get("v")
@@ -272,14 +291,18 @@ for epoch in range(n_epochs):
 
         out_spikes = (
             spikes['Y'].get("s")
-                .view(250, n_classes, 1)
+                .view(time, n_classes, 1)
         )
+        sstep = args.teach*400
         sum_spikes = (
-            out_spikes.sum(0).sum(1)
+            out_spikes[sstep:].sum(0).sum(1)
         )
-        pred_label = torch.argmax(sum_spikes)
-        pred_labels.append(pred_label)
 
+        pred_label = torch.argmax(sum_spikes).cpu()
+        if not sum_spikes.sum() or sum_spikes.sum() == 10*sum_spikes.max():
+            pred_label = torch.tensor(-1)
+        pred_labels.append(pred_label)
+        #print(batch["label"], pred_label, sum_spikes)
         # Optionally plot various simulation information.
         if plot:
             image = batch["image"].view(28, 28)
@@ -288,22 +311,39 @@ for epoch in range(n_epochs):
             square_weights = get_square_weights(
                 input_exc_weights.view(784, n_neurons), n_sqrt, 28
             )
-            square_assignments = get_square_assignments(assignments, n_sqrt)
+
+            exc_out_weights = network.connections[("Ae", "Y")]
+            #print('############')
+
+
+            #print(network.DA)
+            #print(exc_out_weights.ws.mean())
+            square_out_weights = get_square_weights(
+                exc_out_weights.w.view(n_neurons, n_classes), 5, 10
+            )
+            square_out_weights_l = get_square_weights(
+                exc_out_weights.wl.view(n_neurons, n_classes), 5, 10
+            )
+            square_out_weights[20:40,] = square_out_weights_l[:20,]
             spikes_ = {layer: spikes[layer].get("s") for layer in ['X', 'Ae', 'Y']}
-            #voltages = {"Ae": exc_voltages, "Ai": inh_voltages}
-            voltages = {"Ae": exc_voltages, "Y": out_voltages}
-            # inpt_axes, inpt_ims = plot_input(
-            #     image, inpt, label=batch["label"], axes=inpt_axes, ims=inpt_ims
-            # )
+            voltages = {"Y": out_voltages}
+            #voltages = {"Ae": exc_voltages, "Y": out_voltages}
             spike_ims, spike_axes = plot_spikes(spikes_, ims=spike_ims, axes=spike_axes)
             #weights_im = plot_weights(square_weights, im=weights_im)
-            #assigns_im = plot_assignments(square_assignments, im=assigns_im)
+            out_weights_im = plot_weights(square_out_weights, im=out_weights_im, wmax=10)
             #perf_ax = plot_performance(accuracy, x_scale=update_interval, ax=perf_ax)
             # voltage_ims, voltage_axes = plot_voltages(
             #     voltages, ims=voltage_ims, axes=voltage_axes, plot_type="line"
-            # )
+            #
 
-            plt.pause(1e-8)
+            inpt_axes, inpt_ims = plot_input(
+                image, inpt, label=batch["label"], axes=inpt_axes, ims=inpt_ims
+            )
+
+            #print(exc_out_weights.w.mean(), exc_out_weights.ws.max(), exc_out_weights.wl.min())
+            #print(spikes_['Ae'].sum(), input_exc_weights.mean())
+
+            plt.pause(1e-6)
 
         network.reset_state_variables()  # Reset state variables.
 

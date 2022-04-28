@@ -9,7 +9,7 @@ from DASTDP import *
 
 from bindsnet.learning import PostPre
 from bindsnet.network import Network
-from bindsnet.network.nodes import AdaptiveLIFNodes, Input, LIFNodes
+from bindsnet.network.nodes import AdaptiveLIFNodes, Input, LIFNodes, DiehlAndCookNodes
 from bindsnet.network.topology import Connection, LocalConnection
 
 class myNet(Network):
@@ -27,24 +27,24 @@ class myNet(Network):
         exc: float = 22.5,
         inh: float = 17.5,
         dt: float = 1.0,
-        baseDA: float = 1.0,
-        DAdecay: float = 0.03,
+        baseDA: float = 0.5,
+        DAdecay: float = 0.5,
         nu: Optional[Union[float, Sequence[float]]] = (1e-4, 1e-2),
         reduction: Optional[callable] = None,
         wmin: float = 0.0,
         wmax: float = 1.0,
-        weight_decay_s=2e-3,
-        weight_decay_l=1e-4,
+        weight_decay_s=6e-3,
+        weight_decay_l=2e-7,
         norm: float = 78.4,
         theta_plus: float = 0.05,
         tc_theta_decay: float = 1e7,
-        observation_period = 20,
+        observation_period: int = 5,
+        num_DA_layers: int = 1,
+        reward_fn = Advantage,
         inpt_shape: Optional[Iterable[int]] = None,
     ) -> None:
         # language=rst
         """
-        Constructor for class ``DiehlAndCook2015``.
-
         :param n_inpt: Number of input neurons. Matches the 1D size of the input data.
         :param n_neurons: Number of excitatory, inhibitory neurons.
         :param exc: Strength of synapse weights from excitatory to inhibitory layer.
@@ -79,6 +79,7 @@ class myNet(Network):
         self.observation_period = observation_period
         self.weight_decay_s = weight_decay_s
         self.weight_decay_l = weight_decay_l
+        self.reward_fn = reward_fn
 
         # Layers
         input_layer = Input(
@@ -88,56 +89,71 @@ class myNet(Network):
             n=self.n_neurons,
             traces=True,
             rest=-65.0,
-            reset=-70.0,
+            reset=-60.0,
             thresh=-52.0,
-            refrac=4,
+            refrac=5,
             tc_decay=100.0,
             tc_trace=20.0,
             theta_plus=theta_plus,
-            tc_theta_decay=tc_theta_decay,
+            tc_theta_decay=1e6,
         )
-        # inh_layer = LIFNodes(
-        #     n=self.n_neurons,
-        #     traces=False,
-        #     rest=-60.0,
-        #     reset=-45.0,
-        #     thresh=-40.0,
-        #     tc_decay=10.0,
-        #     refrac=2,
-        #     tc_trace=20.0,
-        # )
 
-        out_layer = AdaptiveLIFNodes(
+        out_layer = AdaptiveLIF(
             n=self.n_ouput,
             traces=True,
             rest=-65.0,
-            reset=-70.0,
-            thresh=-52.0,
-            refrac=4,
-            tc_decay=100.0,
+            reset=-60.0, #66
+            thresh=-52.0, #63
+            refrac=5,
+            tc_decay=250.0,
             tc_trace=20.0,
-            theta_plus=theta_plus,
-            tc_theta_decay=tc_theta_decay,
+            theta_plus=0.05,
+            tc_theta_decay=1e5,
         )
 
-        # Connections
-        ws = 0.15 * torch.rand(self.n_inpt, self.n_neurons) + 0.1
-        wl = 0.05 * torch.rand(self.n_inpt, self.n_neurons)
+        #DA Connections
+        if num_DA_layers == 2:
+            ws = 0.15 * torch.rand(self.n_inpt, self.n_neurons) + 0.1
+            wl = 0.05 * torch.rand(self.n_inpt, self.n_neurons)
+            input_exc_conn = DAConnection(
+                source=input_layer,
+                target=exc_layer,
+                ws=ws,
+                wl=wl,
+                weight_decay_s = weight_decay_s,
+                weight_decay_l = weight_decay_l,
+                update_rule=DASTDP,
+                nu=nu,
+                reduction=reduction,
+                wmin=wmin,
+                wmax=wmax,
+                norm=norm,
+            )
 
-        input_exc_conn = DAConnection(
-            source=input_layer,
-            target=exc_layer,
-            ws=ws,
-            wl=wl,
-            weight_decay_s = weight_decay_s,
-            weight_decay_l = weight_decay_l,
-            update_rule=DASTDP,
-            nu=nu,
-            reduction=reduction,
-            wmin=wmin,
-            wmax=wmax,
-            norm=norm,
-        )
+        else:
+            #w = 0.3 * torch.rand(self.n_inpt, self.n_neurons)
+            ckp = torch.load('./ckp/trained_ex_56400.ckp')
+            #print(ckp)
+            w = ckp.X_to_Ae.w
+            exc_layer.theta = ckp.Ae.theta
+            print('loaded')
+
+            #print(ckp.X_to_Ae)
+            #print(ckp.X_to_Ae.b)
+
+            input_exc_conn = Connection(
+                source=input_layer,
+                target=exc_layer,
+                w=w,
+                update_rule=PostPre,
+                nu=nu,
+                reduction=reduction,
+                wmin=wmin,
+                wmax=wmax,
+                norm=norm,
+            )
+
+
         # w = self.exc * torch.diag(torch.ones(self.n_neurons))
         # exc_inh_conn = Connection(
         #     source=exc_layer, target=inh_layer, w=w, wmin=0, wmax=self.exc
@@ -150,25 +166,26 @@ class myNet(Network):
             source=exc_layer, target=exc_layer, w=w, wmin=-self.inh, wmax=0
         )
 
-        w_out_s = 0.15 * torch.rand(self.n_neurons, self.n_ouput)
-        w_out_l = 0.15 * torch.rand(self.n_neurons, self.n_ouput)+0.1
+        w_out_s = 0.0 * torch.rand(self.n_neurons, self.n_ouput) + 0.
+        w_out_l = 0.5 * torch.rand(self.n_neurons, self.n_ouput) + 3.5
 
         exc_out_conn = DAConnection(
             source=exc_layer,
             target=out_layer,
             ws=w_out_s,
             wl=w_out_l,
-            weight_decay_s = weight_decay_s,
-            weight_decay_l = weight_decay_l,
+            weight_decay_s=weight_decay_s,
+            weight_decay_l=weight_decay_l,
             update_rule=DASTDP,
-            nu=nu,
+            nu=(1e-4, 1e-2),
             reduction=reduction,
-            wmin=wmin,
-            wmax=wmax,
+            wmin=0,
+            wmax=10,
             norm=norm,
+            baseDA = self.baseDA
         )
 
-        w_out_recurrent = -self.inh * (
+        w_out_recurrent = -1.5*self.inh * (
                 torch.ones(self.n_ouput, self.n_ouput)
                 - torch.diag(torch.ones(self.n_ouput))
         )
@@ -176,7 +193,7 @@ class myNet(Network):
             source=out_layer,
             target=out_layer,
             w=w_out_recurrent,
-            wmin=-self.inh,
+            wmin=-2*self.inh,
             wmax=0,
         )
 
@@ -184,16 +201,14 @@ class myNet(Network):
         # Add to network
         self.add_layer(input_layer, name="X")
         self.add_layer(exc_layer, name="Ae")
-        #self.add_layer(inh_layer, name="Ai")
         self.add_layer(out_layer, name="Y")
         self.add_connection(input_exc_conn, source="X", target="Ae")
-        #self.add_connection(exc_inh_conn, source="Ae", target="Ai")
         self.add_connection(recurrent_exc_conn, source="Ae", target="Ae")
         self.add_connection(exc_out_conn, source="Ae", target="Y")
         self.add_connection(recurrent_connection, source="Y", target="Y")
 
     def run(
-            self, inputs: Dict[str, torch.Tensor], time: int, one_step=False, label=None, **kwargs
+            self, inputs: Dict[str, torch.Tensor], time: int, one_step=False, label=None, teach=False, **kwargs
     ) -> None:
         assert type(inputs) == dict, (
             "'inputs' must be a dict of names of layers "
@@ -205,12 +220,13 @@ class myNet(Network):
         masks = kwargs.get("masks", {})
         injects_v = kwargs.get("injects_v", {})
 
-        # Compute reward.
-        if self.reward_fn is not None:
-            kwargs["reward"] = self.reward_fn.compute(**kwargs)
+        self.DA = self.baseDA
+        self.sum_spikes = torch.zeros(self.n_ouput)
 
-        #print(inputs["X"][230, 0, 0])
-
+        ####teacher signal#
+        if teach:
+            injects_v["Y"] = torch.zeros([500, 10]).cuda()
+            injects_v["Y"][:450, label] = 0.4
 
         # Dynamic setting of batch size.
         if inputs != {}:
@@ -296,19 +312,16 @@ class myNet(Network):
                         .get("s")
                         .view(self.observation_period, self.n_ouput, 1)
                 )
-                self.sum_spikes = (
-                    out_spikes.sum(0).sum(1)
-                )
-                if self.sum_spikes.max() != self.sum_spikes.min():
-                    pred_label = torch.argmax(self.sum_spikes)
-                    target_spikes = self.sum_spikes[label]
-                    pred_spikes = self.sum_spikes[pred_label]
-                    self.DA += (label==pred_label)*0.5
+                self.sum_spikes = out_spikes.sum(0).sum(1)
+                #self.DA += 4 * self.reward_fn(self.sum_spikes, label, self.n_ouput)
+                self.DA += 2 * self.sum_spikes[label] - 1. * self.sum_spikes.sum()
+                #print(self.DA)
+                #self.DA = self.DA if self.DA < 1 else 1
 
             # Run synapse updates.
             for c in self.connections:
                 self.connections[c].update(
-                    mask=masks.get(c, None), learning=self.learning, DA=self.DA-self.baseDA, **kwargs
+                    mask=masks.get(c, None), learning=self.learning, DA=self.DA, a_minus=1e-1, **kwargs
                 )
 
             # # Get input to all layers.
@@ -320,6 +333,11 @@ class myNet(Network):
 
             self.DA -= (self.DA-self.baseDA)*self.DAdecay
 
+
+            #print(self.connections[('X', 'Ae')].w.mean())
+
+
         # Re-normalize connections.
-        for c in self.connections:
-            self.connections[c].normalize()
+        #for c in self.connections:
+        self.connections[("X", "Ae")].normalize()
+        #self.connections[("Ae", "Y")].normalize()
