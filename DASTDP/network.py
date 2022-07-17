@@ -14,10 +14,6 @@ from bindsnet.network.topology import Connection, LocalConnection
 
 class myNet(Network):
     # language=rst
-    """
-    Implements the spiking neural network architecture from `(Diehl & Cook 2015)
-    <https://www.frontiersin.org/articles/10.3389/fncom.2015.00099/full>`_.
-    """
 
     def __init__(
         self,
@@ -28,13 +24,13 @@ class myNet(Network):
         inh: float = 17.5,
         dt: float = 1.0,
         baseDA: float = 0.5,
-        DAdecay: float = 0.5,
+        DAdecay: float = 0.2,
         nu: Optional[Union[float, Sequence[float]]] = (1e-4, 1e-2),
         reduction: Optional[callable] = None,
         wmin: float = 0.0,
         wmax: float = 1.0,
-        weight_decay_s=6e-3,
-        weight_decay_l=2e-7,
+        weight_decay_s=1e-2,
+        weight_decay_l=1e-7,
         norm: float = 78.4,
         theta_plus: float = 0.05,
         tc_theta_decay: float = 1e7,
@@ -85,7 +81,7 @@ class myNet(Network):
         input_layer = Input(
             n=self.n_inpt, shape=self.inpt_shape, traces=True, tc_trace=20.0
         )
-        exc_layer = AdaptiveLIFNodes(
+        exc_layer = DiehlAndCookNodes(
             n=self.n_neurons,
             traces=True,
             rest=-65.0,
@@ -95,20 +91,31 @@ class myNet(Network):
             tc_decay=100.0,
             tc_trace=20.0,
             theta_plus=theta_plus,
-            tc_theta_decay=1e6,
+            tc_theta_decay=1e7,
+        )
+
+        inh_layer = LIFNodes(
+            n=self.n_neurons,
+            traces=True,
+            rest=-60.0,
+            reset=-45.0,
+            thresh=-40.0,
+            tc_decay=10.0,
+            refrac=2,
+            tc_trace=20.0,
         )
 
         out_layer = AdaptiveLIF(
             n=self.n_ouput,
             traces=True,
             rest=-65.0,
-            reset=-60.0, #66
-            thresh=-52.0, #63
+            reset=-60.0,
+            thresh=-52.0,
             refrac=5,
-            tc_decay=250.0,
-            tc_trace=20.0,
-            theta_plus=0.05,
-            tc_theta_decay=1e5,
+            tc_decay=1000.0,
+            tc_trace=100.0,
+            theta_plus=0.01, #0.005
+            tc_theta_decay=1e6,
         )
 
         #DA Connections
@@ -125,14 +132,22 @@ class myNet(Network):
                 update_rule=DASTDP,
                 nu=nu,
                 reduction=reduction,
-                wmin=wmin,
-                wmax=wmax,
+                wmin=0,
+                wmax=1,
                 norm=norm,
             )
 
         else:
-            #w = 0.3 * torch.rand(self.n_inpt, self.n_neurons)
-            ckp = torch.load('./ckp/trained_ex_56400.ckp')
+            w = 0.3 * torch.rand(self.n_inpt, self.n_neurons)
+            if n_neurons == 100:
+                if inh==60:
+                    ckp = torch.load('./ckp/inh60_1000.ckp')
+                elif inh==120:
+                    ckp = torch.load('./ckp/inh120_5000.ckp')
+            elif n_neurons == 400:
+                ckp = torch.load('./ckp/9600_400_inh60.ckp')
+            else:
+                print('noload')
             #print(ckp)
             w = ckp.X_to_Ae.w
             exc_layer.theta = ckp.Ae.theta
@@ -145,29 +160,31 @@ class myNet(Network):
                 source=input_layer,
                 target=exc_layer,
                 w=w,
-                update_rule=PostPre,
-                nu=nu,
+                update_rule=None, #PostPre
+                nu=(1e-5, 1e-4),
                 reduction=reduction,
-                wmin=wmin,
-                wmax=wmax,
+                wmin=0,
+                wmax=1,
                 norm=norm,
             )
 
-
-        # w = self.exc * torch.diag(torch.ones(self.n_neurons))
-        # exc_inh_conn = Connection(
-        #     source=exc_layer, target=inh_layer, w=w, wmin=0, wmax=self.exc
-        # )
-        w = -self.inh * (
-            torch.ones(self.n_neurons, self.n_neurons)
-            - torch.diag(torch.ones(self.n_neurons))
+        w = self.exc * torch.diag(torch.ones(self.n_neurons))
+        exc_inh_conn = Connection(
+            source=exc_layer, target=inh_layer,
+            w=w, wmin=0, wmax=self.exc
         )
-        recurrent_exc_conn = Connection(
-            source=exc_layer, target=exc_layer, w=w, wmin=-self.inh, wmax=0
+        w = -self.inh * (
+                torch.ones(self.n_neurons, self.n_neurons)
+                - torch.diag(torch.ones(self.n_neurons))
+        )
+        inh_exc_conn = Connection(
+            source=inh_layer, target=exc_layer,
+            #update_rule=iSTDP, nu=(-1e-3, 1e-2, 1e-4),
+            w=w, wmin=-self.inh, wmax=0
         )
 
         w_out_s = 0.0 * torch.rand(self.n_neurons, self.n_ouput) + 0.
-        w_out_l = 0.5 * torch.rand(self.n_neurons, self.n_ouput) + 3.5
+        w_out_l = 0.1 * torch.rand(self.n_neurons, self.n_ouput) + 3.5
 
         exc_out_conn = DAConnection(
             source=exc_layer,
@@ -177,15 +194,27 @@ class myNet(Network):
             weight_decay_s=weight_decay_s,
             weight_decay_l=weight_decay_l,
             update_rule=DASTDP,
-            nu=(1e-4, 1e-2),
+            nu=(-5e-2, 5e-1),
             reduction=reduction,
             wmin=0,
-            wmax=10,
+            wmax=wmax,
             norm=norm,
-            baseDA = self.baseDA
+            baseDA=self.baseDA
         )
 
-        w_out_recurrent = -1.5*self.inh * (
+        # w = -0.2 * torch.ones(self.n_neurons, self.n_ouput)
+        # inh_out_conn = Connection(
+        #     source=inh_layer,
+        #     target=out_layer,
+        #     w=w,
+        #     update_rule=iSTDP,
+        #     nu=(1e-3, 1e-6),
+        #     reduction=reduction,
+        #     wmin=-3,
+        #     wmax=0,
+        # )
+
+        w_out_recurrent = -1 * self.inh * (
                 torch.ones(self.n_ouput, self.n_ouput)
                 - torch.diag(torch.ones(self.n_ouput))
         )
@@ -193,7 +222,7 @@ class myNet(Network):
             source=out_layer,
             target=out_layer,
             w=w_out_recurrent,
-            wmin=-2*self.inh,
+            wmin=-15,
             wmax=0,
         )
 
@@ -201,11 +230,19 @@ class myNet(Network):
         # Add to network
         self.add_layer(input_layer, name="X")
         self.add_layer(exc_layer, name="Ae")
+        self.add_layer(inh_layer, name="Ai")
         self.add_layer(out_layer, name="Y")
+
         self.add_connection(input_exc_conn, source="X", target="Ae")
-        self.add_connection(recurrent_exc_conn, source="Ae", target="Ae")
+
+        self.add_connection(exc_inh_conn, source="Ae", target="Ai")
+        self.add_connection(inh_exc_conn, source="Ai", target="Ae")
+
         self.add_connection(exc_out_conn, source="Ae", target="Y")
+        #self.add_connection(inh_out_conn, source="Ai", target="Y")
+
         self.add_connection(recurrent_connection, source="Y", target="Y")
+
 
     def run(
             self, inputs: Dict[str, torch.Tensor], time: int, one_step=False, label=None, teach=False, **kwargs
@@ -222,13 +259,13 @@ class myNet(Network):
 
         self.DA = self.baseDA
         self.sum_spikes = torch.zeros(self.n_ouput)
-
         ####teacher signal#
         if teach:
-            injects_v["Y"] = torch.zeros([500, 10]).cuda()
-            injects_v["Y"][:450, label] = 0.4
+            injects_v["Y"] = torch.zeros([time, 10]).cuda()
+            injects_v["Y"][:100, label] = 0.05
 
         # Dynamic setting of batch size.
+        #print(self.layers['Ae'].theta)
         if inputs != {}:
             for key in inputs:
                 # goal shape is [time, batch, n_0, ...]
@@ -321,7 +358,7 @@ class myNet(Network):
             # Run synapse updates.
             for c in self.connections:
                 self.connections[c].update(
-                    mask=masks.get(c, None), learning=self.learning, DA=self.DA, a_minus=1e-1, **kwargs
+                    mask=masks.get(c, None), learning=self.learning, DA=self.DA, **kwargs
                 )
 
             # # Get input to all layers.

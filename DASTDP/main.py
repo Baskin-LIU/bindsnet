@@ -31,9 +31,9 @@ parser.add_argument("--n_test", type=int, default=10000)
 parser.add_argument("--n_train", type=int, default=60000)
 parser.add_argument("--n_workers", type=int, default=-1)
 parser.add_argument("--exc", type=float, default=22.5)
-parser.add_argument("--inh", type=float, default=10)
+parser.add_argument("--inh", type=float, default=120)
 parser.add_argument("--theta_plus", type=float, default=0.05)
-parser.add_argument("--time", type=int, default=500)
+parser.add_argument("--time", type=int, default=350)
 parser.add_argument("--dt", type=int, default=1.0)
 parser.add_argument("--intensity", type=float, default=128)
 parser.add_argument("--progress_interval", type=int, default=10)
@@ -45,7 +45,7 @@ parser.add_argument("--plot", dest="plot", action="store_true")
 parser.add_argument("--gpu", dest="gpu", action="store_true")
 parser.add_argument("--teach", dest="teach", action="store_true")
 
-parser.set_defaults(plot=False, gpu=True, teach=False)
+parser.set_defaults(plot=False, gpu=True, teach=False, train=True)
 
 args = parser.parse_args()
 
@@ -67,7 +67,7 @@ train = args.train
 test = not train
 plot = args.plot
 gpu = args.gpu
-wmax = 1
+wmax = 10
 
 # Sets up Gpu use
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,8 +86,6 @@ print("Running on Device = ", device)
 if n_workers == -1:
     n_workers = 0  # gpu * 4 * torch.cuda.device_count()
 
-if not test:
-    update_interval = n_test
 
 n_sqrt = int(np.ceil(np.sqrt(n_neurons)))
 start_intensity = intensity
@@ -107,7 +105,12 @@ network = myNet(
     wmax=wmax,
 )
 if args.load:
-    network= torch.load(open(args.load, "rb"))
+    network = torch.load(open(args.load, "rb"))
+    w = network.Ai_to_Ae.w
+    print(network.Y.theta)
+    #print(w.min(),w.max(),w.mean())
+    #print(w[0])
+
 # Directs network to GPU
 if gpu:
     network.to("cuda")
@@ -126,10 +129,10 @@ train_dataset = MNIST(
     None,
     root=os.path.join("..", "..", "data", "MNIST"),
     download=True,
-    train=True,
+    train=train,
     transform=transforms.Compose(
         [transforms.ToTensor(),
-         NormalizeIntensity(0.12),
+         #NormalizeIntensity(0.12),
          transforms.Lambda(lambda x: x * intensity)] # modify intensity to increase Hz
     ),
 )
@@ -189,6 +192,7 @@ voltage_axes, voltage_ims = None, None
 
 # Train the network.
 print("\nBegin training.\n")
+network.train(mode=train)
 start = t()
 for epoch in range(n_epochs):
     labels = []
@@ -313,28 +317,30 @@ for epoch in range(n_epochs):
             )
 
             exc_out_weights = network.connections[("Ae", "Y")]
+            #print(exc_out_weights.w.shape)
             #print('############')
 
 
             #print(network.DA)
             #print(exc_out_weights.ws.mean())
             square_out_weights = get_square_weights(
-                exc_out_weights.w.view(n_neurons, n_classes), 5, 10
+                exc_out_weights.w.view(n_neurons, n_classes), 5, n_sqrt
             )
             square_out_weights_l = get_square_weights(
-                exc_out_weights.wl.view(n_neurons, n_classes), 5, 10
+                exc_out_weights.wl.view(n_neurons, n_classes), 5, n_sqrt
             )
             square_out_weights[20:40,] = square_out_weights_l[:20,]
             spikes_ = {layer: spikes[layer].get("s") for layer in ['X', 'Ae', 'Y']}
             voltages = {"Y": out_voltages}
+            #print(out_voltages[:, :10])
             #voltages = {"Ae": exc_voltages, "Y": out_voltages}
             spike_ims, spike_axes = plot_spikes(spikes_, ims=spike_ims, axes=spike_axes)
             #weights_im = plot_weights(square_weights, im=weights_im)
-            out_weights_im = plot_weights(square_out_weights, im=out_weights_im, wmax=10)
+            out_weights_im = plot_weights(square_out_weights, im=out_weights_im, wmax=wmax)
             #perf_ax = plot_performance(accuracy, x_scale=update_interval, ax=perf_ax)
-            # voltage_ims, voltage_axes = plot_voltages(
-            #     voltages, ims=voltage_ims, axes=voltage_axes, plot_type="line"
-            #
+            voltage_ims, voltage_axes = plot_voltages(
+                voltages, ims=voltage_ims, axes=voltage_axes, plot_type="line")
+
 
             inpt_axes, inpt_ims = plot_input(
                 image, inpt, label=batch["label"], axes=inpt_axes, ims=inpt_ims
@@ -342,7 +348,7 @@ for epoch in range(n_epochs):
 
             #print(exc_out_weights.w.mean(), exc_out_weights.ws.max(), exc_out_weights.wl.min())
             #print(spikes_['Ae'].sum(), input_exc_weights.mean())
-
+            #print(network.connections[("Ai", "Y")].w.min(), exc_out_weights.w.mean())
             plt.pause(1e-6)
 
         network.reset_state_variables()  # Reset state variables.

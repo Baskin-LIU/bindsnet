@@ -9,6 +9,7 @@ import torch
 from bindsnet.network.topology import (
     AbstractConnection,
     LocalConnection,
+    Connection,
 )
 
 from bindsnet.learning.learning import LearningRule
@@ -79,7 +80,7 @@ class DASTDP(LearningRule):
             self.reduction = reduction
 
         # Weight decay.
-        self.weight_decay = weight_decay
+        self.weight_decay = 1.0 - weight_decay if weight_decay else 1.0
         self.weight_decay_s = 1.0 - weight_decay_s if weight_decay_s else 1.0
         self.weight_decay_l = 1.0 - weight_decay_l if weight_decay_l else 1.0
 
@@ -121,7 +122,9 @@ class DASTDP(LearningRule):
             del source_x, target_s
 
         update /= self.connection.wmax
-        transfer = np.exp(da - 6.5)
+        #transfer = np.exp(da - 6.5)
+        transfer = boosted * da * 1e-3
+
         self.connection.wl += self.connection.ws * transfer
         self.connection.ws += update - self.connection.ws * transfer
 
@@ -134,7 +137,6 @@ class DASTDP(LearningRule):
         # print(self.connection.ws.mean())
         # print(self.connection.wl.mean())
         # print('#####################')
-        super().update()
 
     def _connection_update_v1(self, **kwargs) -> None:
         # language=rst
@@ -201,6 +203,122 @@ class DASTDP(LearningRule):
         self.connection.wl *= self.weight_decay_l
 
         self.connection.w.copy_(self.connection.ws + self.connection.wl)
+
+
+class iSTDP(LearningRule):
+    # language=rst
+    """
+    Dopamine-modulated STDP.
+    """
+
+    def __init__(
+        self,
+        connection: AbstractConnection,
+        nu: Optional[Union[float, Sequence[float]]] = None,
+        reduction: Optional[callable] = None,
+        weight_decay: float = 0.0,
+        weight_decay_s: float = 0.0,
+        weight_decay_l: float = 0.0,
+        p0: float = 0.01,
+        baseDA: float = 0.5,
+        **kwargs,
+    ) -> None:
+        # language=rst
+        """
+        Constructor for ``MSTDP`` learning rule.
+
+        :param connection: An ``AbstractConnection`` object whose weights the ``MSTDP``
+            learning rule will modify.
+        :param nu: Single or pair of learning rates for pre- and post-synaptic events,
+            respectively.
+        :param reduction: Method for reducing parameter updates along the minibatch
+            dimension.
+        :param weight_decay: Coefficient controlling rate of decay of the weights each iteration.
+
+        Keyword arguments:
+
+        :param tc_plus: Time constant for pre-synaptic firing trace.
+        :param tc_minus: Time constant for post-synaptic firing trace.
+        """
+        self.connection = connection
+        self.source = connection.source
+        self.target = connection.target
+
+        self.wmin = connection.wmin
+        self.wmax = connection.wmax
+        self.tc_plus = torch.tensor(kwargs.get("tc_plus", 20.0))
+        self.tc_minus = torch.tensor(kwargs.get("tc_minus", 20.0))
+        self.tc_e_trace = torch.tensor(kwargs.get("tc_e_trace", 25.0))
+        self.baseDA = baseDA
+
+        # Learning rate(s).
+        if nu is None:
+            nu = [0.0, 0.0]
+        elif isinstance(nu, (float, int)):
+            nu = [nu, nu]
+
+        self.nu = torch.zeros(3, dtype=torch.float)
+        self.nu[0] = nu[0]
+        self.nu[1] = nu[1]
+        self.nu[2] = nu[2]
+        self.p0 = p0
+
+        # Parameter update reduction across minibatch dimension.
+        if reduction is None:
+            if self.source.batch_size == 1:
+                self.reduction = torch.squeeze
+            else:
+                self.reduction = torch.sum
+        else:
+            self.reduction = reduction
+
+        # Weight decay.
+        self.weight_decay = 1.0 - weight_decay if weight_decay else 1.0
+        self.weight_decay_s = 1.0 - weight_decay_s if weight_decay_s else 1.0
+        self.weight_decay_l = 1.0 - weight_decay_l if weight_decay_l else 1.0
+
+        if isinstance(connection, (DAConnection, Connection)):
+            self.update = self._connection_update
+        else:
+            raise NotImplementedError(
+                "This learning rule is not supported for this Connection type."
+            )
+
+        self.tc_plus = torch.tensor(kwargs.get("tc_plus", 20.0))
+        self.tc_minus = torch.tensor(kwargs.get("tc_minus", 20.0))
+
+    def _connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Post-pre learning rule for ``Connection`` subclass of ``AbstractConnection``
+        class.
+        """
+        da = kwargs["DA"]
+        boosted = da > self.baseDA
+        #####################
+        batch_size = self.source.batch_size
+
+        update = torch.zeros_like(self.connection.w)
+        # Pre-synaptic update.
+        if self.nu[0]:
+            source_s = self.source.s.view(batch_size, -1).unsqueeze(2).float()
+            target_x = (self.target.x.view(batch_size, -1).unsqueeze(1)) * self.nu[0]
+            update += self.reduction(torch.bmm(source_s, target_x), dim=0)# * (self.wmin - self.connection.w)
+
+            update += self.reduction(source_s.repeat(1, 1, target_x.shape[0]), dim=0) * self.nu[2] * self.connection.w
+
+            del source_s, target_x
+        # Post-synaptic update.
+        if self.nu[1]:
+            target_s = self.target.s.view(batch_size, -1).unsqueeze(1).float() * self.nu[1]
+            source_x = self.source.x.view(batch_size, -1).unsqueeze(2)
+            update += self.reduction(torch.bmm(source_x, target_s), dim=0)
+            #update -= self.reduction(source_x.repeat(1,1,10), dim=0) * self.nu[1] * self.connection.w * da
+            del source_x, target_s
+
+        self.connection.w -= update
+
+        super().update()
 
 
 class DAConnection(AbstractConnection):
@@ -444,12 +562,73 @@ class AdaptiveLIF(DiehlAndCookNodes):
             **kwargs,
         )
 
+    def forward(self, x: torch.Tensor) -> None:
+        # language=rst
+        """
+        Runs a single simulation step.
+
+        :param x: Inputs to the layer.
+        """
+        # Decay voltages and adaptive thresholds.
+        self.v = self.decay * (self.v - self.rest) + self.rest
+        if self.learning:
+            self.theta *= self.theta_decay
+
+        # Integrate inputs.
+        self.v += (self.refrac_count <= 0).float() * x
+
+        # Decrement refractory counters.
+        self.refrac_count -= self.dt
+
+        # Check for spiking neurons.
+        self.s = self.v >= self.thresh + self.theta
+
+        # Refractoriness, voltage reset, and adaptive thresholds.
+        self.refrac_count.masked_fill_(self.s, self.refrac)
+        self.v.masked_fill_(self.s, self.reset)
+        if self.learning:
+            #self.theta += torch.log(self.theta+1.01) * self.theta_plus * self.s.float().sum(0)
+            self.theta += self.theta_plus * self.s.float().sum(0)
+
+        if self.one_spike:
+            if self.s.any():
+                _any = self.s.view(self.batch_size, -1).any(1)
+                ind = torch.multinomial(
+                    self.s.float().view(self.batch_size, -1)[_any], 1
+                )
+                _any = _any.nonzero()
+                self.s.zero_()
+                self.s.view(self.batch_size, -1)[_any, ind] = 1
+
+        # voltage clipping to lowerbound
+        if self.lbound is not None:
+            self.v.masked_fill_(self.v < self.lbound, self.lbound)
+
+        if self.traces:
+            # Decay and set spike traces.
+            self.x *= self.trace_decay
+
+            if self.traces_additive:
+                self.x += self.trace_scale * self.s.float()
+            else:
+                self.x.masked_fill_(self.s.bool(), self.trace_scale)
+
+        if self.sum_input:
+            # Add current input to running sum.
+            self.summed += x.float()
+
     def reset_state_variables(self) -> None:
         # language=rst
         """
         Resets relevant state variables.
         """
-        #super().reset_state_variables()
+        self.s.zero_()
+
+        if self.traces:
+            self.x.zero_()  # Spike traces.
+
+        if self.sum_input:
+            self.summed.zero_()
         self.v.fill_(self.rest)  # Neuron voltages.
         self.refrac_count.zero_()  # Refractory period counters.
 
