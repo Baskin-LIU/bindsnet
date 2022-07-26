@@ -34,7 +34,7 @@ class myNet(Network):
         norm: float = 78.4,
         theta_plus: float = 0.05,
         tc_theta_decay: float = 1e7,
-        observation_period: int = 5,
+        observation_period: int = 10,
         num_DA_layers: int = 1,
         reward_fn = Advantage,
         inpt_shape: Optional[Iterable[int]] = None,
@@ -145,13 +145,23 @@ class myNet(Network):
                 elif inh==120:
                     ckp = torch.load('./ckp/inh120_5000.ckp')
             elif n_neurons == 400:
-                ckp = torch.load('./ckp/9600_400_inh60.ckp')
+                if inh==60:
+                    ckp = torch.load('./ckp/9600_400_inh60.ckp')
+                elif inh==120:
+                    ckp = torch.load('./ckp/inh120_400_1500.ckp')
+
+            elif n_neurons == 1600:
+                if inh==120:
+                    ckp = torch.load('./ckp/inh120_1600_21500.ckp')
+
             else:
+                ckp=None
                 print('noload')
             #print(ckp)
-            w = ckp.X_to_Ae.w
-            exc_layer.theta = ckp.Ae.theta
-            print('loaded')
+            if ckp:
+                w = ckp.X_to_Ae.w
+                exc_layer.theta = ckp.Ae.theta
+                print('loaded')
 
             #print(ckp.X_to_Ae)
             #print(ckp.X_to_Ae.b)
@@ -194,7 +204,7 @@ class myNet(Network):
             weight_decay_s=weight_decay_s,
             weight_decay_l=weight_decay_l,
             update_rule=DASTDP,
-            nu=(-5e-2, 5e-1),
+            nu=(-1e-1, 1e0),
             reduction=reduction,
             wmin=0,
             wmax=wmax,

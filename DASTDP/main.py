@@ -329,7 +329,7 @@ for epoch in range(n_epochs):
             square_out_weights_l = get_square_weights(
                 exc_out_weights.wl.view(n_neurons, n_classes), 5, n_sqrt
             )
-            square_out_weights[20:40,] = square_out_weights_l[:20,]
+            square_out_weights[30:50,] = square_out_weights_l[:20,]
             spikes_ = {layer: spikes[layer].get("s") for layer in ['X', 'Ae', 'Y']}
             voltages = {"Y": out_voltages}
             #print(out_voltages[:, :10])
