@@ -1,2 +1,7 @@
 This is the DACP (STDP version) project by Bingkun LIU
 You can find saved checkpoints for pretrained hidden layers and final training (labeled as final) in ./ckp/
+
+
+To run the training or test, please follow the arguments specified in main.py.
+Example:
+python3 main.py -test --n_neurons 400 --time 350 --inh 120 --load ./ckp/400_final.ckp
